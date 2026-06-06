@@ -1,0 +1,263 @@
+import os
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import random
+from tqdm.auto import tqdm
+from torch.utils.data import DataLoader, Dataset
+from torch.optim import AdamW
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score, roc_curve, auc
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModel
+from peft import LoraConfig, get_peft_model
+
+# ==========================================
+# 0. DETERMINISTIC SETUP
+# ==========================================
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+# ==========================================
+# 1. CONFIGURATION (Zero-Gap Optimized)
+# ==========================================
+CONFIG = {
+    "drug_model": "DeepChem/ChemBERTa-77M-MLM",
+    "prot_model": "facebook/esm2_t6_8M_UR50D",
+    "batch_size": 8,
+    "epochs": 100,
+    "patience": 5,             
+    "lr_encoder": 1e-5,   
+    "lr_head": 1e-4,      
+    "weight_decay": 0.15,      
+    "target_noise": 0.08,      
+    "dropout_rate": 0.6,       
+    "max_gap_allowed": 0.02,   
+    "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    "save_path": "best_zero_gap_model.pt"
+}
+
+# ==========================================
+# 2. DATA PREP
+# ==========================================
+def load_and_prep():
+    print("🔄 Loading BALM datasets...")
+    configs = ["Mpro", "USP7", "SYK", "HIF2A", "MCL1", "LeakyPDB"]
+    dfs = []
+    for c in configs:
+        try:
+            ds = load_dataset("BALM/BALM-benchmark", c, split="train")
+            df_c = ds.to_pandas()
+            df_c["source"] = c
+            dfs.append(df_c)
+        except: 
+            pass
+    
+    df = pd.concat(dfs).dropna(subset=["Drug", "Target", "Y"]).reset_index(drop=True)
+    target_stats = {}
+    df["Y_norm"] = 0.0
+    for tgt, grp in df.groupby("Target"):
+        mu, sigma = grp["Y"].mean(), grp["Y"].std()
+        sigma = sigma if sigma > 1e-6 else 1.0
+        target_stats[tgt] = (mu, sigma)
+        df.loc[grp.index, "Y_norm"] = (grp["Y"] - mu) / sigma
+        
+    tr_v, test = train_test_split(df, test_size=0.1, random_state=42)
+    tr, val = train_test_split(tr_v, test_size=0.11, random_state=42)
+    return tr, val, test, target_stats
+
+train_df, val_df, test_df, TARGET_STATS = load_and_prep()
+
+# ==========================================
+# 3. DATASET & MODEL ARCHITECTURE
+# ==========================================
+class DTADataset(Dataset):
+    def __init__(self, df, d_tok, p_tok):
+        self.df = df.reset_index(drop=True)
+        self.d_tok = d_tok
+        self.p_tok = p_tok
+
+    def __len__(self): 
+        return len(self.df)
+
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        d = self.d_tok(row["Drug"], truncation=True, padding="max_length", max_length=128, return_tensors="pt")
+        p = self.p_tok(row["Target"], truncation=True, padding="max_length", max_length=256, return_tensors="pt")
+        return {k: v.squeeze(0) for k, v in d.items()}, {k: v.squeeze(0) for k, v in p.items()}, torch.tensor(row["Y_norm"], dtype=torch.float), row["Target"]
+
+def masked_mean(hidden, mask):
+    mask = mask.unsqueeze(-1).float()
+    return (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
+
+class DTAModel(nn.Module):
+    def __init__(self, proj_dim=256):
+        super().__init__()
+        self.drug_enc = AutoModel.from_pretrained(CONFIG["drug_model"])
+        self.prot_enc = get_peft_model(AutoModel.from_pretrained(CONFIG["prot_model"]), LoraConfig(r=8, lora_alpha=16, target_modules=["query", "value"], lora_dropout=CONFIG["dropout_rate"]))
+        
+        d_hidden, p_hidden = self.drug_enc.config.hidden_size, self.prot_enc.config.hidden_size
+        self.d_proj = nn.Sequential(nn.Linear(d_hidden, proj_dim), nn.Dropout(CONFIG["dropout_rate"]))
+        self.p_proj = nn.Sequential(nn.Linear(p_hidden, proj_dim), nn.Dropout(CONFIG["dropout_rate"]))
+        
+        self.head = nn.Sequential(
+            nn.Linear(proj_dim * 2, 512), nn.LayerNorm(512), nn.GELU(), nn.Dropout(CONFIG["dropout_rate"]),
+            nn.Linear(512, 1)
+        )
+
+    def forward(self, d_in, p_in):
+        d_h = self.drug_enc(**d_in).last_hidden_state
+        p_h = self.prot_enc(**p_in).last_hidden_state
+        d_g = self.d_proj(masked_mean(d_h, d_in["attention_mask"]))
+        p_g = self.p_proj(masked_mean(p_h, p_in["attention_mask"]))
+        return self.head(torch.cat([d_g, p_g], dim=1))
+
+# ==========================================
+# 4. TRAINING UTILS
+# ==========================================
+def evaluate(loader, model):
+    model.eval()
+    p_denorm, t_denorm, total_loss = [], [], 0
+    with torch.no_grad():
+        for d, p, y, tgts in loader:
+            d, p, y_t = {k: v.to(CONFIG["device"]) for k, v in d.items()}, {k: v.to(CONFIG["device"]) for k, v in p.items()}, y.to(CONFIG["device"]).view(-1,1)
+            out = model(d, p)
+            total_loss += nn.HuberLoss()(out.squeeze(), y_t.squeeze()).item()
+            for o, yv, tn in zip(out.cpu().numpy().flatten(), y.numpy(), tgts):
+                mu, s = TARGET_STATS[tn]
+                p_denorm.append(o*s+mu)
+                t_denorm.append(yv*s+mu)
+    return np.array(p_denorm), np.array(t_denorm), total_loss/len(loader)
+
+d_tok = AutoTokenizer.from_pretrained(CONFIG["drug_model"])
+p_tok = AutoTokenizer.from_pretrained(CONFIG["prot_model"])
+
+def collate_fn(batch):
+    d, p, y, t = zip(*batch)
+    return {k: torch.stack([x[k] for x in d]) for k in d[0]}, {k: torch.stack([x[k] for x in p]) for k in p[0]}, torch.stack(y), list(t)
+
+train_loader = DataLoader(DTADataset(train_df, d_tok, p_tok), batch_size=CONFIG["batch_size"], shuffle=True, collate_fn=collate_fn)
+val_loader = DataLoader(DTADataset(val_df, d_tok, p_tok), batch_size=CONFIG["batch_size"], collate_fn=collate_fn)
+test_loader = DataLoader(DTADataset(test_df, d_tok, p_tok), batch_size=CONFIG["batch_size"], collate_fn=collate_fn)
+
+model = DTAModel().to(CONFIG["device"])
+optimizer = AdamW(model.parameters(), lr=CONFIG["lr_head"], weight_decay=CONFIG["weight_decay"])
+history = {"train_loss": [], "val_loss": [], "train_r2": [], "val_r2": []}
+best_mse, p_cnt = float("inf"), 0
+
+# ==========================================
+# 5. TRAIN LOOP
+# ==========================================
+for epoch in range(CONFIG["epochs"]):
+    model.train()
+    total_tr_loss, tr_p, tr_t = 0, [], []
+    for d, p, y, tgts in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
+        y_noisy = y + torch.randn_like(y) * CONFIG["target_noise"]
+        d, p, y_n = {k: v.to(CONFIG["device"]) for k, v in d.items()}, {k: v.to(CONFIG["device"]) for k, v in p.items()}, y_noisy.to(CONFIG["device"]).view(-1,1)
+        optimizer.zero_grad()
+        out = model(d, p)
+        loss = nn.HuberLoss()(out.squeeze(), y_n.squeeze())
+        loss.backward()
+        optimizer.step()
+        total_tr_loss += loss.item()
+        for o, yv, tn in zip(out.detach().cpu().numpy().flatten(), y.numpy(), tgts):
+            mu, s = TARGET_STATS[tn]
+            tr_p.append(o*s+mu)
+            tr_t.append(yv*s+mu)
+
+    tr_r2 = r2_score(tr_t, tr_p)
+    v_p, v_t, v_loss = evaluate(val_loader, model)
+    v_mse, v_r2 = mean_squared_error(v_t, v_p), r2_score(v_t, v_p)
+    gap = abs(tr_r2 - v_r2)
+
+    history["train_loss"].append(total_tr_loss/len(train_loader))
+    history["val_loss"].append(v_loss)
+    history["train_r2"].append(tr_r2)
+    history["val_r2"].append(v_r2)
+
+    print(f"📊 [Epoch {epoch+1}] Train R²: {tr_r2:.4f} | Val R²: {v_r2:.4f} (Gap: {gap:.4f})")
+
+    if v_mse < best_mse and gap < CONFIG["max_gap_allowed"]:
+        best_mse, p_cnt = v_mse, 0
+        torch.save(model.state_dict(), CONFIG["save_path"])
+        print(f"    ⭐ Best Model Saved (Gap: {gap:.4f})")
+    else: 
+        p_cnt += 1
+        
+    if p_cnt >= CONFIG["patience"]: 
+        print("🛑 Early stopping triggered to prevent gap expansion")
+        break
+
+# ==========================================
+# 6. FINAL EVALUATION & COMPREHENSIVE SUBPLOTS
+# ==========================================
+if 'model' in locals():
+    model.load_state_dict(torch.load(CONFIG["save_path"]))
+    model.eval()
+    
+    ts_p, ts_t, _ = evaluate(test_loader, model)
+    test_r2 = r2_score(ts_t, ts_p)
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    sns.set_style("whitegrid")
+
+    # --- (1) Top Left Plot: Learning Curves ---
+    axes[0, 0].plot(history["train_loss"], label="Train Loss", color='#3498db', linewidth=2)
+    axes[0, 0].plot(history["val_loss"], label="Validation Loss", color='#f1c40f', linewidth=2)
+    axes[0, 0].set_title("A. Learning Curves (Zero-Gap)", fontsize=14, fontweight='bold')
+    axes[0, 0].set_xlabel("Epochs", fontsize=11)
+    axes[0, 0].set_ylabel("Loss", fontsize=11)
+    axes[0, 0].legend()
+
+    # --- (2) Top Right Plot: Train/Validation R² Progress ---
+    axes[0, 1].plot(history["train_r2"], label="Train R²", color='#2ecc71', linewidth=2)
+    axes[0, 1].plot(history["val_r2"], label="Validation R²", color='#e67e22', linewidth=2)
+    axes[0, 1].set_title("B. Train/Validation R² Progress", fontsize=14, fontweight='bold')
+    axes[0, 1].set_xlabel("Epochs", fontsize=11)
+    axes[0, 1].set_ylabel("R² Score", fontsize=11)
+    axes[0, 1].legend(loc="lower right")
+
+    # --- (3) Bottom Left Plot: Actual vs Predicted ---
+    sns.regplot(x=ts_t, y=ts_p, ax=axes[1, 0],
+                scatter_kws={'alpha':0.3, 'color':'#2c3e50', 's': 20},
+                line_kws={'color':'#e74c3c', 'linewidth': 3})
+    axes[1, 0].set_title(f'C. Final Test R²: {test_r2:.4f}', fontsize=14, fontweight='bold')
+    axes[1, 0].set_xlabel("Actual Binding Affinity", fontsize=11)
+    axes[1, 0].set_ylabel("Predicted Binding Affinity", fontsize=11)
+    axes[1, 0].grid(True, linestyle='--', alpha=0.5)
+
+    # --- (4) Bottom Right Plot: ROC Curve ---
+    threshold = 7.0
+    y_true_binary = (ts_t > threshold).astype(int)
+    y_scores_normalized = (ts_p - ts_p.min()) / (ts_p.max() - ts_p.min())
+    
+    if len(np.unique(y_true_binary)) > 1:
+        fpr, tpr, _ = roc_curve(y_true_binary, y_scores_normalized)
+        roc_auc = auc(fpr, tpr)
+        axes[1, 1].plot(fpr, tpr, color='#9b59b6', linewidth=3, label=f'AUC = {roc_auc:.2f}')
+        axes[1, 1].plot([0, 1], [0, 1], color='gray', linestyle='--')
+        axes[1, 1].set_title(f"D. Classification Power (Threshold: {threshold})", fontsize=14, fontweight='bold')
+        axes[1, 1].set_xlabel('False Positive Rate (1 - Specificity)', fontsize=11)
+        axes[1, 1].set_ylabel('True Positive Rate (Sensitivity)', fontsize=11)
+        axes[1, 1].legend(loc="lower right")
+    else:
+        axes[1, 1].text(0.5, 0.5, 'AUC Skipped (One class)', ha='center', va='center')
+
+    plt.tight_layout()
+    plt.savefig("final_comprehensive_figure.png", dpi=300)
+    plt.show()
+    print("✅ Comprehensive metric figures saved successfully!")
+else:
+    print("❌ Error: Active model parameters not resolved in current local context state memory instance.")
